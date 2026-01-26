@@ -150,37 +150,81 @@ const cleanupRemote = () => {
 
   // Remove the folder in case it already exists
   fs.rmSync(clonedDir, { recursive: true, force: true });
+  console.log(`[cleanupRemote] Starting cleanup of remote repository: ${url}`);
 
   try {
     // Clone the repository
-    execSync(`git clone ${url} ${clonedDir}`, { stdio: "ignore" });
+    console.log(`[cleanupRemote] Cloning repository to ${clonedDir}...`);
+    execSync(`git clone ${url} ${clonedDir}`, { stdio: "inherit" });
 
     const repoExists = fs.existsSync(clonedDir);
     if (!repoExists) {
       throw Error("Failed to clone repo");
     }
+    console.log(`[cleanupRemote] Repository cloned successfully`);
+
+    // Check current branch - don't assume "master"
+    console.log(`[cleanupRemote] Checking current branch...`);
+    const branchResult = execSync("git rev-parse --abbrev-ref HEAD", {
+      cwd: clonedDir,
+      encoding: "utf-8",
+    }).trim();
+    console.log(`[cleanupRemote] Current branch: ${branchResult}`);
+
+    // List commits to check if repo has any
+    console.log(`[cleanupRemote] Checking repository history...`);
+    try {
+      const logResult = execSync("git log --oneline -5", {
+        cwd: clonedDir,
+        encoding: "utf-8",
+      });
+      console.log(`[cleanupRemote] Recent commits:\n${logResult}`);
+    } catch (e) {
+      console.log(`[cleanupRemote] No commits found in repository (empty repo)`);
+    }
 
     // Remove all files except .git
+    console.log(`[cleanupRemote] Removing all files from working directory...`);
     execSync('find . -type f -not -path "./.git*" -delete', {
-      stdio: "ignore",
+      stdio: "inherit",
       cwd: clonedDir,
     });
 
     // Commit empty state
-    execSync("git add -A", { stdio: "ignore", cwd: clonedDir });
-    execSync('git commit -m "Cleanup"', {
-      stdio: "ignore",
-      cwd: clonedDir,
-    });
+    console.log(`[cleanupRemote] Staging changes...`);
+    execSync("git add -A", { stdio: "inherit", cwd: clonedDir });
 
-    // Push changes
-    execSync("git push", { stdio: "ignore", cwd: clonedDir });
+    console.log(`[cleanupRemote] Creating cleanup commit...`);
+    try {
+      execSync('git commit -m "Cleanup"', {
+        stdio: "inherit",
+        cwd: clonedDir,
+      });
+      console.log(`[cleanupRemote] Commit created successfully`);
+    } catch (e) {
+      console.log(`[cleanupRemote] No changes to commit (already empty)`);
+    }
+
+    // Push changes - use the actual branch name we detected
+    console.log(`[cleanupRemote] Pushing changes to remote branch '${branchResult}'...`);
+    try {
+      execSync(`git push origin ${branchResult}`, { stdio: "inherit", cwd: clonedDir });
+      console.log(`[cleanupRemote] Push successful`);
+    } catch (e) {
+      console.error(`[cleanupRemote] Push failed: ${e.message}`);
+      console.log(`[cleanupRemote] This may be expected if the repository is empty or branch doesn't exist remotely`);
+      throw e;
+    }
   } catch (error) {
-    console.error(`Error: ${error.message}`);
+    console.error(`[cleanupRemote] Error during cleanup: ${error.message}`);
+    console.error(`[cleanupRemote] Stack trace: ${error.stack}`);
+    throw error;
   }
 
   // Remove the folder when everything is done
+  console.log(`[cleanupRemote] Cleaning up temporary directory...`);
   fs.rmSync(clonedDir, { recursive: true, force: true });
+  console.log(`[cleanupRemote] Cleanup completed successfully`);
 };
 
 const BENCHMARK_DATA = [

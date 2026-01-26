@@ -3,6 +3,7 @@ import MetadataStore, { MANIFEST_FILE_NAME } from "./metadata-store";
 import { GiteeSyncSettings } from "./settings/settings";
 import Logger, { LOG_FILE_NAME } from "./logger";
 import GiteeSyncPlugin from "./main";
+import GitignoreParser from "./gitignore-parser";
 
 /**
  * Tracks changes to local sync directory and updates files metadata.
@@ -13,6 +14,7 @@ export default class EventsListener {
     private metadataStore: MetadataStore,
     private settings: GiteeSyncSettings,
     private logger: Logger,
+    private gitignoreParser: GitignoreParser,
   ) {}
 
   start(plugin: GiteeSyncPlugin) {
@@ -154,6 +156,9 @@ export default class EventsListener {
     ) {
       // Sync configs only if the user explicitly wants to
       return true;
+    } else if (this.gitignoreParser.isIgnored(filePath)) {
+      // Check if file is ignored by .gitignore rules
+      return false;
     } else {
       // All other files can be synced
       return true;

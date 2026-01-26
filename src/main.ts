@@ -160,11 +160,26 @@ export default class GiteeSyncPlugin extends Plugin {
         // Shown only if sync doesn't fail
         new Notice("Sync successful", 5000);
       } catch (err) {
+        // Log the error with full details
+        await this.logger.error("First sync failed", {
+          message: err.message,
+          stack: err.stack,
+          status: err.status,
+          name: err.name,
+        });
+        // Also log to console for debugging
+        console.error("[GiteeSyncPlugin] First sync failed:", err);
+        console.error("[GiteeSyncPlugin] Error details:", {
+          message: err.message,
+          stack: err.stack,
+          status: err.status,
+        });
         // Show the error to the user, it's not automatically dismissed to make sure
         // the user sees it.
         new Notice(`Error syncing. ${err}`);
+      } finally {
+        notice.hide();
       }
-      notice.hide();
     } else {
       await this.syncManager.sync();
     }

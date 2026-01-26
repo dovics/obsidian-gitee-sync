@@ -1,10 +1,9 @@
 {
   "id": "gitee-sync",
   "name": "Gitee Sync",
-  "version": "1.0.7",
+  "version": "0.0.1",
   "minAppVersion": "1.7.7",
   "description": "Sync a Gitee repository with vaults on different platforms without requiring git installation",
   "author": "Modified from GitHub Gitless Sync by Silvano Cerza",
-  "authorUrl": "https://silvanocerza.com",
   "isDesktopOnly": false
 }

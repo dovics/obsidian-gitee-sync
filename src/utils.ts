@@ -24,6 +24,20 @@ export function decodeBase64String(s: string): string {
 }
 
 /**
+ * Encodes a string to base64, properly handling UTF-8 characters
+ * including Chinese characters, emojis, and other non-ASCII chars.
+ *
+ * @param str The string to encode
+ * @returns Base64 encoded string
+ */
+export function encodeBase64String(str: string): string {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(str);
+  const binary = Array.from(data, (byte) => String.fromCharCode(byte)).join("");
+  return btoa(binary);
+}
+
+/**
  * Copies the provided text to the system clipboard.
  * Uses the modern Clipboard API with a fallback to older APIs.
  *
@@ -87,12 +101,22 @@ export async function retryUntil<T>(
 
   while (true) {
     const result = await fn();
+    const conditionMet = condition(result);
 
-    if (condition(result) || retries >= maxRetries) {
+    // Log retry attempts for debugging
+    if (retries > 0) {
+      console.log(`[retryUntil] Attempt ${retries + 1}/${maxRetries + 1} completed, condition met: ${conditionMet}, delay was: ${delay}ms`);
+    }
+
+    if (conditionMet || retries >= maxRetries) {
+      if (retries >= maxRetries && !conditionMet) {
+        console.log(`[retryUntil] Max retries (${maxRetries}) reached, returning last result`);
+      }
       return result;
     }
 
     retries++;
+    console.log(`[retryUntil] Condition not met, retrying in ${delay}ms...`);
     await new Promise((resolve) => setTimeout(resolve, delay));
     delay *= backoffFactor;
   }

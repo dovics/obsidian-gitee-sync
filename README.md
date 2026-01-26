@@ -2,6 +2,10 @@
 
 Plugin to sync a Gitee repository with an Obsidian vault.
 
+## Acknowledgements
+
+This plugin is based on and inspired by [GitHub Gitless Sync](https://github.com/silvanocerza/github-gitless-sync) by [Silvano Cerza](https://github.com/silvanocerza), adapted to work with Gitee instead of GitHub. The original plugin provides excellent git-less synchronization for GitHub repositories using REST APIs, and this project adapts that concept for the Gitee platform.
+
 I highly recommend not using this plugin with another sync service.
 This might create problems for this plugin when determining what needs to be synced between remote repository and local vault.
 
@@ -128,7 +132,7 @@ Other plugins don't know about that file, so if you sync with others too you ris
 
 ## Contributing
 
-This is a modified version of the original GitHub Gitless Sync plugin adapted for Gitee. For issues or contributions related to the original plugin, please visit the [original repository](https://github.com/silvanocerza/github-gitless-sync).
+This is a modified version of the [GitHub Gitless Sync](https://github.com/silvanocerza/github-gitless-sync) plugin adapted for Gitee. For issues or contributions related to the original GitHub plugin, please visit the [original repository](https://github.com/silvanocerza/github-gitless-sync).
 
 For Gitee-specific issues, please check that they are not related to the API differences between GitHub and Gitee before reporting.
 

@@ -248,34 +248,78 @@ export default class GiteeClient {
     retry?: boolean;
     maxRetries?: number;
   }): Promise<string> {
+    await this.logger.info("GiteeClient: Starting commitChanges", {
+      changesCount: changes.length,
+      message,
+      retry,
+      maxRetries,
+      branch: this.settings.giteeBranch,
+      owner: this.settings.giteeOwner,
+      repo: this.settings.giteeRepo,
+    });
+
+    const requestBody = {
+      access_token: this.settings.giteeToken,
+      message: message,
+      branch: this.settings.giteeBranch,
+      actions: changes,
+    };
+
+    await this.logger.info("GiteeClient: Request body prepared", {
+      actionsCount: changes.length,
+      actions: changes.map(c => ({
+        action: c.action,
+        path: c.path,
+        hasContent: !!c.content,
+        hasFromPath: !!c.from_path,
+      })),
+    });
+
     const response = await retryUntil(
       async () => {
-        return requestUrl({
-          url: `https://gitee.com/api/v5/repos/${this.settings.giteeOwner}/${this.settings.giteeRepo}/commits`,
+        const url = `https://gitee.com/api/v5/repos/${this.settings.giteeOwner}/${this.settings.giteeRepo}/commits`;
+        await this.logger.info("GiteeClient: Sending commit request", { url });
+
+        const result = requestUrl({
+          url: url,
           headers: this.headers(),
           method: "POST",
-          body: JSON.stringify({
-            access_token: this.settings.giteeToken,
-            message: message,
-            branch: this.settings.giteeBranch,
-            actions: changes,
-          }),
+          body: JSON.stringify(requestBody),
           throw: false,
         });
+
+        return result;
       },
       (res) => res.status !== 422,
       retry ? maxRetries : 0,
     );
 
+    await this.logger.info("GiteeClient: Received response after retries", {
+      status: response.status,
+      statusText: response.text,
+      hasJson: !!response.json,
+    });
+
     if (response.status < 200 || response.status >= 400) {
-      await this.logger.error("Failed to commit changes", response);
+      await this.logger.error("GiteeClient: Failed to commit changes", {
+        status: response.status,
+        statusText: response.text,
+        json: response.json,
+        responseHeaders: response.headers,
+      });
       throw new GiteeAPIError(
         response.status,
         `Failed to commit changes, status ${response.status}`,
       );
     }
 
-    return response.json.sha;
+    const commitSha = response.json.sha;
+    await this.logger.info("GiteeClient: Commit successful", {
+      commitSha,
+      htmlUrl: response.json.html_url,
+    });
+
+    return commitSha;
   }
 
   /**

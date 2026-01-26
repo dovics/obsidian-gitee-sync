@@ -21,6 +21,7 @@ import Logger, { LOG_FILE_NAME } from "./logger";
 import { decodeBase64String, hasTextExtension } from "./utils";
 import GiteeSyncPlugin from "./main";
 import { BlobReader, Entry, Uint8ArrayWriter, ZipReader } from "@zip.js/zip.js";
+import GitignoreParser from "./gitignore-parser";
 
 interface SyncAction {
   type: "upload" | "download" | "delete_local" | "delete_remote";
@@ -42,11 +43,20 @@ type OnConflictsCallback = (
   conflicts: ConflictFile[],
 ) => Promise<ConflictResolution[]>;
 
+type NewTreeRequestItem = {
+  path: string;
+  mode: string;
+  type: string;
+  sha?: string | null;
+  content?: string;
+};
+
 export default class SyncManager {
   private metadataStore: MetadataStore;
   private client: GiteeClient;
   private eventsListener: EventsListener;
   private syncIntervalId: number | null = null;
+  private gitignoreParser: GitignoreParser;
 
   // Use to track if syncing is in progress, this ideally
   // prevents multiple syncs at the same time and creation
@@ -61,11 +71,13 @@ export default class SyncManager {
   ) {
     this.metadataStore = new MetadataStore(this.vault);
     this.client = new GiteeClient(this.settings, this.logger);
+    this.gitignoreParser = new GitignoreParser(this.vault);
     this.eventsListener = new EventsListener(
       this.vault,
       this.metadataStore,
       this.settings,
       this.logger,
+      this.gitignoreParser,
     );
   }
 
@@ -107,17 +119,34 @@ export default class SyncManager {
 
   private async firstSyncImpl() {
     await this.logger.info("Starting first sync");
+    await this.logger.info("First sync settings", {
+      giteeOwner: this.settings.giteeOwner,
+      giteeRepo: this.settings.giteeRepo,
+      giteeBranch: this.settings.giteeBranch,
+    });
+
     let repositoryIsEmpty = false;
     let res: RepoContent;
     let files: {
       [key: string]: GetTreeResponseItem;
     } = {};
     let treeSha: string = "";
+
+    await this.logger.info("Fetching remote repo content for first sync...");
     try {
       res = await this.client.getRepoContent();
       files = res.files;
       treeSha = res.sha;
+      await this.logger.info("Remote repo content fetched successfully", {
+        filesCount: Object.keys(files).length,
+        treeSha,
+      });
     } catch (err) {
+      await this.logger.error("Failed to fetch remote repo content", {
+        message: err.message,
+        status: err.status,
+        stack: err.stack,
+      });
       // 409 is returned in case the remote repo has been just created
       // and contains no files.
       // 404 instead is returned in case there are no files.
@@ -128,6 +157,9 @@ export default class SyncManager {
       }
       // The repository is bare, meaning it has no tree, no commits and no branches
       repositoryIsEmpty = true;
+      await this.logger.info("Remote repository is empty (409 or 404)", {
+        repositoryIsEmpty,
+      });
     }
 
     if (repositoryIsEmpty) {
@@ -241,10 +273,9 @@ export default class SyncManager {
           return;
         }
 
-        if (targetPath.split("/").last()?.startsWith(".")) {
-          // We must skip hidden files as that creates issues with syncing.
-          // This is fine as users can't edit hidden files in Obsidian anyway.
-          await this.logger.info("Skipping hidden file", targetPath);
+        // Check if file is ignored by .gitignore rules
+        if (this.gitignoreParser.isIgnored(targetPath)) {
+          await this.logger.info("Skipping ignored file (from .gitignore)", targetPath);
           return;
         }
 
@@ -261,18 +292,29 @@ export default class SyncManager {
         }
 
         const normalizedPath = normalizePath(targetPath);
-        await this.vault.adapter.writeBinary(normalizedPath, data);
+        await this.vault.adapter.writeBinary(
+          normalizedPath,
+          data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength),
+        );
         await this.logger.info("Written file", {
           normalizedPath,
         });
-        this.metadataStore.data.files[normalizedPath] = {
-          path: normalizedPath,
-          sha: files[normalizedPath].sha,
-          dirty: false,
-          justDownloaded: true,
-          lastModified: Date.now(),
-        };
-        await this.metadataStore.save();
+
+        // Only add to metadata if the file exists in the remote files list
+        if (files[normalizedPath]) {
+          this.metadataStore.data.files[normalizedPath] = {
+            path: normalizedPath,
+            sha: files[normalizedPath].sha,
+            dirty: false,
+            justDownloaded: true,
+            lastModified: Date.now(),
+          };
+          await this.metadataStore.save();
+        } else {
+          await this.logger.warn("File not in remote tree, skipping metadata", {
+            normalizedPath,
+          });
+        }
       }),
     );
 
@@ -290,7 +332,7 @@ export default class SyncManager {
           acc: { [key: string]: NewTreeRequestItem },
           item: NewTreeRequestItem,
         ) => ({ ...acc, [item.path]: item }),
-        {},
+        {} as { [key: string]: NewTreeRequestItem },
       );
     // Add files that are in the manifest but not in the tree.
     await Promise.all(
@@ -350,7 +392,7 @@ export default class SyncManager {
           acc: { [key: string]: NewTreeRequestItem },
           item: NewTreeRequestItem,
         ) => ({ ...acc, [item.path]: item }),
-        {},
+        {} as { [key: string]: NewTreeRequestItem },
       );
     await Promise.all(
       Object.keys(this.metadataStore.data.files)
@@ -405,20 +447,41 @@ export default class SyncManager {
       // Shown only if sync doesn't fail
       new Notice("Sync successful", 5000);
     } catch (err) {
+      // Log the error with full details
+      await this.logger.error("Sync failed", {
+        message: err.message,
+        stack: err.stack,
+        status: err.status,
+        name: err.name,
+      });
+      // Also log to console for debugging
+      console.error("[SyncManager] Sync failed:", err);
+      console.error("[SyncManager] Error details:", {
+        message: err.message,
+        stack: err.stack,
+        status: err.status,
+      });
       // Show the error to the user, it's not automatically dismissed to make sure
       // the user sees it.
       new Notice(`Error syncing. ${err}`);
+    } finally {
+      this.syncing = false;
+      notice.hide();
     }
-    this.syncing = false;
-    notice.hide();
   }
 
   private async syncImpl() {
+    let files: { [key: string]: GetTreeResponseItem };
+    let treeSha: string;
+    let manifest: GetTreeResponseItem | undefined;
+
     await this.logger.info("Starting sync");
-    const { files, sha: treeSha } = await this.client.getRepoContent({
+    const repoContent = await this.client.getRepoContent({
       retry: true,
     });
-    const manifest = files[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`];
+    files = repoContent.files;
+    treeSha = repoContent.sha;
+    manifest = files[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`];
 
     if (manifest === undefined) {
       await this.logger.error("Remote manifest is missing", { files, treeSha });
@@ -439,9 +502,65 @@ export default class SyncManager {
       path: `${this.vault.configDir}/${MANIFEST_FILE_NAME}`,
       retry: true,
     });
-    const remoteMetadata: Metadata = JSON.parse(
-      decodeBase64String(fileContent.content),
-    );
+
+    await this.logger.info("Retrieved manifest file content", {
+      path: `${this.vault.configDir}/${MANIFEST_FILE_NAME}`,
+      contentLength: fileContent.content?.length,
+      contentType: fileContent.type,
+      encoding: fileContent.encoding,
+      contentPreview: fileContent.content?.substring(0, 100),
+    });
+
+    // Gitee API returns content in different formats depending on the endpoint
+    // For the /contents/{path} endpoint, text files may return content as:
+    // 1. base64 encoded string (with encoding: "base64")
+    // 2. plain text string (with encoding: "text" or undefined)
+    // We need to handle both cases by trying multiple approaches
+    const manifestContentRaw = fileContent.content;
+
+    await this.logger.info("Attempting to parse manifest content...");
+
+    // Try different parsing strategies
+    const strategies = [
+      {
+        name: "Direct JSON parse (no encoding)",
+        parse: (content: string) => JSON.parse(content),
+      },
+      {
+        name: "Base64 decode then JSON parse",
+        parse: (content: string) => JSON.parse(decodeBase64String(content)),
+      },
+      {
+        name: "Double base64 decode then JSON parse",
+        parse: (content: string) => JSON.parse(decodeBase64String(decodeBase64String(content))),
+      },
+    ];
+
+    let remoteMetadata: Metadata | undefined;
+    for (const strategy of strategies) {
+      try {
+        await this.logger.info(`Trying strategy: ${strategy.name}`);
+        const result = strategy.parse(manifestContentRaw);
+        remoteMetadata = result;
+        await this.logger.info(`Successfully parsed manifest using: ${strategy.name}`, {
+          preview: JSON.stringify(remoteMetadata).substring(0, 200),
+        });
+        break;
+      } catch (err) {
+        await this.logger.info(`Strategy "${strategy.name}" failed`, {
+          error: err.message,
+        });
+      }
+    }
+
+    if (!remoteMetadata) {
+      await this.logger.error("All parsing strategies failed", {
+        originalContent: manifestContentRaw,
+      });
+      throw new Error(
+        `Failed to parse manifest after trying all strategies (direct, single base64, double base64)`
+      );
+    }
 
     const conflicts = await this.findConflicts(remoteMetadata.files);
 
@@ -520,7 +639,7 @@ export default class SyncManager {
           acc: { [key: string]: NewTreeRequestItem },
           item: NewTreeRequestItem,
         ) => ({ ...acc, [item.path]: item }),
-        {},
+        {} as { [key: string]: NewTreeRequestItem },
       );
 
     await Promise.all(
@@ -823,10 +942,17 @@ export default class SyncManager {
     baseTreeSha: string,
     conflictResolutions: ConflictResolution[] = [],
   ) {
+    await this.logger.info("Starting commitSync", {
+      treeFilesCount: Object.keys(treeFiles).length,
+      baseTreeSha,
+      conflictResolutionsCount: conflictResolutions.length,
+    });
+
     // Update local sync time
     const syncTime = Date.now();
     this.metadataStore.data.lastSync = syncTime;
-    this.metadataStore.save();
+    await this.logger.info("Updated sync time", { syncTime });
+    await this.metadataStore.save();
 
     // We update the last modified timestamp for all files that had resolved conflicts
     conflictResolutions.forEach((resolution) => {
@@ -839,49 +965,95 @@ export default class SyncManager {
 
     // Process files that need to be uploaded or updated
     for (const filePath of Object.keys(treeFiles)) {
-      const treeFile = treeFiles[filePath];
-
-      if (treeFile.sha === null) {
-        // File needs to be deleted
-        changes.push({
-          action: "delete",
-          path: filePath,
+      try {
+        const treeFile = treeFiles[filePath];
+        await this.logger.info("Processing file for commit", {
+          filePath,
+          hasContent: treeFile.content !== undefined,
+          shaIsNull: treeFile.sha === null,
         });
-        // Mark as deleted in metadata
-        if (this.metadataStore.data.files[filePath]) {
-          this.metadataStore.data.files[filePath].deleted = true;
-          this.metadataStore.data.files[filePath].deletedAt = syncTime;
+
+        if (treeFile.sha === null) {
+          // File needs to be deleted
+          await this.logger.info("Marking file for deletion", { filePath });
+          changes.push({
+            action: "delete",
+            path: filePath,
+          });
+          // Mark as deleted in metadata
+          if (this.metadataStore.data.files[filePath]) {
+            this.metadataStore.data.files[filePath].deleted = true;
+            this.metadataStore.data.files[filePath].deletedAt = syncTime;
+          }
+        } else if (treeFile.content !== undefined) {
+          // File needs to be uploaded or updated
+          let content: string;
+
+          // For binary files or files already with content, use the content directly
+          if (treeFile.content === "binaryfile" || !hasTextExtension(filePath)) {
+            await this.logger.info("Reading binary file", { filePath });
+            const buffer = await this.vault.adapter.readBinary(
+              normalizePath(filePath),
+            );
+            content = arrayBufferToBase64(buffer);
+            await this.logger.info("Binary file encoded", {
+              filePath,
+              contentLength: content.length,
+            });
+          } else {
+            // For text files, use the content directly - Gitee API doesn't need base64 encoding
+            content = treeFile.content;
+            await this.logger.info("Using text content directly", {
+              filePath,
+              contentLength: content.length,
+            });
+          }
+
+          // Calculate SHA for metadata tracking
+          await this.logger.info("Calculating SHA for file", { filePath });
+          const sha = await this.calculateSHA(filePath);
+          if (!this.metadataStore.data.files[filePath]) {
+            this.metadataStore.data.files[filePath] = {
+              path: filePath,
+              sha: sha,
+              dirty: false,
+              justDownloaded: false,
+              lastModified: Date.now(),
+            };
+            await this.logger.info("Created new metadata entry for file", {
+              filePath,
+              sha,
+            });
+          }
+          this.metadataStore.data.files[filePath].sha = sha;
+
+          // Determine if this is a create or update action
+          // If file already exists in remote (treeFile has a sha that's not from current state), use update
+          // Otherwise use create
+          const fileExistsInRemote = treeFile.sha && treeFile.sha !== this.metadataStore.data.files[filePath]?.sha;
+          const actionType = fileExistsInRemote ? "update" : "create";
+
+          await this.logger.info("Adding file change", {
+            filePath,
+            actionType,
+            fileExistsInRemote,
+            treeFileSha: treeFile.sha,
+            metadataSha: this.metadataStore.data.files[filePath]?.sha,
+          });
+
+          changes.push({
+            action: actionType,
+            path: filePath,
+            content: content,
+          });
         }
-      } else if (treeFile.content !== undefined) {
-        // File needs to be uploaded or updated
-        let content: string;
-
-        // For binary files or files already with content, use the content directly
-        if (treeFile.content === "binaryfile" || !hasTextExtension(filePath)) {
-          const buffer = await this.vault.adapter.readBinary(
-            normalizePath(filePath),
-          );
-          content = arrayBufferToBase64(buffer);
-        } else {
-          // For text files, use the content directly and encode to base64
-          content = btoa(treeFile.content);
-        }
-
-        // Calculate SHA for metadata tracking
-        const sha = await this.calculateSHA(filePath);
-        this.metadataStore.data.files[filePath].sha = sha;
-
-        // Determine if this is a create or update action
-        // If file already exists in remote (treeFile has a sha that's not from current state), use update
-        // Otherwise use create
-        const fileExistsInRemote = treeFile.sha && treeFile.sha !== this.metadataStore.data.files[filePath]?.sha;
-        const actionType = fileExistsInRemote ? "update" : "create";
-
-        changes.push({
-          action: actionType,
-          path: filePath,
-          content: content,
+      } catch (err) {
+        await this.logger.error("Error processing file for commit", {
+          filePath,
+          error: err.message,
+          stack: err.stack,
         });
+        throw err;
       }
     }
 
@@ -889,28 +1061,70 @@ export default class SyncManager {
     const manifestPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
     const manifestFile = this.metadataStore.data.files[manifestPath];
     const manifestExists = manifestFile && manifestFile.sha !== null && manifestFile.sha !== undefined;
+
+    await this.logger.info("Preparing manifest file for commit", {
+      manifestPath,
+      manifestExists,
+      manifestFileSha: manifestFile?.sha,
+    });
+
+    const manifestJson = JSON.stringify(this.metadataStore.data);
+    // Gitee API doesn't need base64 encoding for text content
+    const manifestContent = manifestJson;
+
+    await this.logger.info("Manifest file prepared", {
+      manifestContentLength: manifestContent.length,
+      action: manifestExists ? "update" : "create",
+    });
+
     changes.push({
       action: manifestExists ? "update" : "create",
       path: manifestPath,
-      content: btoa(JSON.stringify(this.metadataStore.data)),
+      content: manifestContent,
     });
 
     // Update manifest SHA
+    await this.logger.info("Calculating manifest SHA");
     const manifestSha = await this.calculateSHA(
       `${this.vault.configDir}/${MANIFEST_FILE_NAME}`,
     );
+    if (!this.metadataStore.data.files[manifestPath]) {
+      this.metadataStore.data.files[manifestPath] = {
+        path: manifestPath,
+        sha: manifestSha,
+        dirty: false,
+        justDownloaded: false,
+        lastModified: Date.now(),
+      };
+    }
     this.metadataStore.data.files[manifestPath].sha = manifestSha;
+    await this.logger.info("Manifest SHA updated", { manifestSha });
 
     // Commit all changes in one request
     if (changes.length > 0) {
-      await this.logger.info("Committing changes", {
+      await this.logger.info("Committing changes to remote", {
         count: changes.length,
+        changes: changes.map(c => ({ action: c.action, path: c.path })),
       });
-      await this.client.commitChanges({
-        changes: changes,
-        message: "Sync",
-        retry: true,
-      });
+
+      try {
+        const commitSha = await this.client.commitChanges({
+          changes: changes,
+          message: "Sync",
+          retry: true,
+        });
+        await this.logger.info("Changes committed successfully", { commitSha });
+      } catch (err) {
+        await this.logger.error("Failed to commit changes to remote", {
+          error: err.message,
+          status: err.status,
+          stack: err.stack,
+          changesCount: changes.length,
+        });
+        throw err;
+      }
+    } else {
+      await this.logger.info("No changes to commit");
     }
 
     // Update the local content of all files that had conflicts we resolved
@@ -968,6 +1182,7 @@ export default class SyncManager {
 
   async loadMetadata() {
     await this.logger.info("Loading metadata");
+    await this.gitignoreParser.load();
     await this.metadataStore.load();
     if (Object.keys(this.metadataStore.data.files).length === 0) {
       await this.logger.info("Metadata was empty, loading all files");
@@ -987,10 +1202,16 @@ export default class SyncManager {
         files.push(...res.files);
         folders.push(...res.folders);
       }
-      files.forEach((filePath: string) => {
+      for (const filePath of files) {
         if (filePath === `${this.vault.configDir}/workspace.json`) {
           // Obsidian recommends not syncing the workspace file
-          return;
+          continue;
+        }
+
+        // Skip files ignored by .gitignore
+        if (this.gitignoreParser.isIgnored(filePath)) {
+          await this.logger.info("Skipping ignored file (from .gitignore)", filePath);
+          continue;
         }
 
         this.metadataStore.data.files[filePath] = {
@@ -1000,7 +1221,7 @@ export default class SyncManager {
           justDownloaded: false,
           lastModified: Date.now(),
         };
-      });
+      }
 
       // Must be the first time we run, initialize the metadata store
       // with itself and all files in the vault.
