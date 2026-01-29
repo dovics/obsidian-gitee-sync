@@ -656,10 +656,13 @@ export default class SyncManager {
             const content =
               resolution?.content ||
               (await this.vault.adapter.read(normalizedPath));
+            // If the file already exists in remote, preserve its sha for correct update detection
+            const existingFile = files[action.filePath];
             newTreeFiles[action.filePath] = {
               path: action.filePath,
               mode: "100644",
               type: "blob",
+              sha: existingFile?.sha,
               content: content,
             };
             break;
@@ -807,6 +810,26 @@ export default class SyncManager {
           return;
         }
 
+        // Handle case where local file is deleted but remote file still exists
+        // This should delete the file from remote (local deletion takes priority)
+        if (localFile.deleted && !remoteFile.deleted) {
+          actions.push({
+            type: "delete_remote",
+            filePath: filePath,
+          });
+          return;
+        }
+
+        // Handle case where remote file is deleted but local file still exists
+        // This should delete the file from local (remote deletion takes priority)
+        if (!localFile.deleted && remoteFile.deleted) {
+          actions.push({
+            type: "delete_local",
+            filePath: filePath,
+          });
+          return;
+        }
+
         const localSHA = await this.calculateSHA(filePath);
         if (remoteFile.sha === localSHA) {
           // If the remote file sha is identical to the actual sha of the local file
@@ -848,6 +871,12 @@ export default class SyncManager {
 
         // For non-deletion cases, if SHAs differ, we just need to check if local changed.
         // Conflicts are already filtered out so we can make this decision easily
+        if (localFile.deleted || localSHA === null) {
+          // File is deleted locally or doesn't exist, skip it
+          // (already handled by the deletion checks above)
+          return;
+        }
+
         if (localSHA !== localFile.sha) {
           actions.push({ type: "upload", filePath: filePath });
           return;
@@ -1028,9 +1057,9 @@ export default class SyncManager {
           this.metadataStore.data.files[filePath].sha = sha;
 
           // Determine if this is a create or update action
-          // If file already exists in remote (treeFile has a sha that's not from current state), use update
+          // If file already exists in remote (treeFile has a sha), use update
           // Otherwise use create
-          const fileExistsInRemote = treeFile.sha && treeFile.sha !== this.metadataStore.data.files[filePath]?.sha;
+          const fileExistsInRemote = treeFile.sha !== undefined && treeFile.sha !== null;
           const actionType = fileExistsInRemote ? "update" : "create";
 
           await this.logger.info("Adding file change", {
@@ -1107,10 +1136,19 @@ export default class SyncManager {
         changes: changes.map(c => ({ action: c.action, path: c.path })),
       });
 
+      // Build commit message with timestamp and file list
+      const now = new Date();
+      const timestamp = now.toISOString();
+      const fileList = changes
+        .filter(c => c.path !== `${this.vault.configDir}/${MANIFEST_FILE_NAME}`)
+        .map(c => `${c.action} ${c.path}`)
+        .join('\n  ');
+      const commitMessage = `Sync ${timestamp}\n\nChanges:\n  ${fileList}`;
+
       try {
         const commitSha = await this.client.commitChanges({
           changes: changes,
-          message: "Sync",
+          message: commitMessage,
           retry: true,
         });
         await this.logger.info("Changes committed successfully", { commitSha });
